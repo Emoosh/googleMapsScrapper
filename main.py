@@ -64,7 +64,7 @@ def itarateOverAllPlacesFound(page: Page, placelimit: int):
             page.goto(url)
             page.wait_for_timeout(3000)
 
-            reviews = get_reviews_for_place(page, max_reviews=10)
+            reviews = get_reviews_for_place(page, max_reviews=100)
 
             place_data = {"url": url, "total_reviews_scraped": len(reviews), "reviews": reviews}
 
