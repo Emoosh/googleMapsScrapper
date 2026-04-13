@@ -2,13 +2,8 @@
 <project version="4">
   <component name="ChangeListManager">
     <list default="true" id="472cf395-92b5-492b-a46b-8651cd01f7a9" name="Changes" comment="initial">
-      <change afterPath="$PROJECT_DIR$/comment_analyzer.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/indexer.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/placeTest.json" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/place_qa.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/scraped_data.json" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/indexer.py" beforeDir="false" afterPath="$PROJECT_DIR$/indexer.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/place_qa.py" beforeDir="false" afterPath="$PROJECT_DIR$/place_qa.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />

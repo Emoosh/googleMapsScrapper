@@ -1,7 +1,7 @@
 """
 indexer.py
 ----------
-scraped_data.json'daki yorumları Gemini text-embedding-004 ile embed eder
+scraped_data.json'daki yorumları intfloat/multilingual-e5-large ile embed eder
 ve ChromaDB'ye kaydeder (persistent). Yeni mekanlar eklenince tekrar
 çalıştırılabilir — zaten indexlenmiş mekanları atlar.
 
@@ -14,7 +14,6 @@ Kullanım:
 import json
 import os
 import sys
-import time
 import logging
 import argparse
 import hashlib
@@ -22,8 +21,8 @@ import re
 from pathlib import Path
 from urllib.parse import unquote
 
-from dotenv import load_dotenv
-from google import genai
+from sentence_transformers import SentenceTransformer
+import torch
 import chromadb
 
 # ---------------------------------------------------------------------------
@@ -39,13 +38,20 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-load_dotenv()
-GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
-EMBED_MODEL = "gemini-embedding-001"
-CHROMA_PATH      = "./chroma_db"
-COLLECTION_NAME  = "place_reviews"
-BATCH_SIZE       = 50    # Gemini embedding batch boyutu
-RATE_LIMIT_DELAY = 0.3   # batch'ler arası bekleme (saniye)
+EMBED_MODEL     = "intfloat/multilingual-e5-large"
+CHROMA_PATH     = "./chroma_db"
+COLLECTION_NAME = "place_reviews"
+
+# CUDA > MPS > CPU otomatik seçim
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+    BATCH_SIZE = 256
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+    BATCH_SIZE = 64
+else:
+    DEVICE = "cpu"
+    BATCH_SIZE = 32
 
 
 # ---------------------------------------------------------------------------
@@ -63,20 +69,11 @@ def extract_place_name(entry: dict) -> str:
 
 
 def place_slug(place_name: str) -> str:
-    """Yer adından sabit 10 karakterlik bir ID prefix'i üretir."""
     return hashlib.md5(place_name.encode()).hexdigest()[:10]
 
 
 def review_doc_id(place_name: str, idx: int) -> str:
     return f"{place_slug(place_name)}_{idx}"
-
-
-def embed_batch(client: genai.Client, texts: list[str]) -> list[list[float]]:
-    embeddings = []
-    for text in texts:
-        result = client.models.embed_content(model=EMBED_MODEL, contents=text)
-        embeddings.append(result.embeddings[0].values)
-    return embeddings
 
 
 # ---------------------------------------------------------------------------
@@ -85,37 +82,35 @@ def embed_batch(client: genai.Client, texts: list[str]) -> list[list[float]]:
 
 def index_place(
     collection,
-    gemini_client: genai.Client,
+    model: SentenceTransformer,
     place_name: str,
     source_url: str,
     reviews: list[str],
 ) -> int:
     """Bir mekanın yorumlarını embed edip ChromaDB'ye ekler. Eklenen yorum sayısını döner."""
 
-    # Zaten indexliyse atla
     existing = collection.get(where={"place_name": place_name}, limit=1)
     if existing["ids"]:
         log.info("  Zaten indexli, atlanıyor.")
         return 0
 
-    added = 0
-    for batch_start in range(0, len(reviews), BATCH_SIZE):
-        batch_texts = reviews[batch_start : batch_start + BATCH_SIZE]
-        embeddings  = embed_batch(gemini_client, batch_texts)
+    # multilingual-e5 için "passage: " prefix'i gerekli
+    prefixed = [f"passage: {r}" for r in reviews]
+    embeddings = model.encode(
+        prefixed,
+        batch_size=BATCH_SIZE,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+    ).tolist()
 
-        collection.add(
-            ids=[review_doc_id(place_name, batch_start + i) for i in range(len(batch_texts))],
-            embeddings=embeddings,
-            documents=batch_texts,
-            metadatas=[{"place_name": place_name, "source_url": source_url}] * len(batch_texts),
-        )
-        added += len(batch_texts)
-        log.info(f"  {batch_start}–{batch_start + len(batch_texts) - 1}. yorumlar indexlendi.")
+    collection.add(
+        ids=[review_doc_id(place_name, i) for i in range(len(reviews))],
+        embeddings=embeddings,
+        documents=reviews,
+        metadatas=[{"place_name": place_name, "source_url": source_url}] * len(reviews),
+    )
 
-        if batch_start + BATCH_SIZE < len(reviews):
-            time.sleep(RATE_LIMIT_DELAY)
-
-    return added
+    return len(reviews)
 
 
 # ---------------------------------------------------------------------------
@@ -123,21 +118,18 @@ def index_place(
 # ---------------------------------------------------------------------------
 
 def run(input_path: str, reset: bool = False):
-    if not GEMINI_API_KEY:
-        log.error("GEMINI_API_KEY bulunamadı.")
-        sys.exit(1)
-
     input_file = Path(input_path)
     if not input_file.exists():
         log.error(f"Girdi dosyası bulunamadı: {input_file}")
         sys.exit(1)
 
+    log.info(f"Device: {DEVICE} | Batch size: {BATCH_SIZE}")
+    log.info(f"Model yükleniyor: {EMBED_MODEL}")
+    model = SentenceTransformer(EMBED_MODEL, device=DEVICE)
+
     with open(input_file, encoding="utf-8") as f:
         scraped_data = json.load(f)
 
-    gemini_client = genai.Client(
-        api_key=GEMINI_API_KEY,
-    )
     chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 
     if reset:
@@ -168,7 +160,7 @@ def run(input_path: str, reset: bool = False):
             skipped += 1
             continue
 
-        added = index_place(collection, gemini_client, place_name, source_url, reviews)
+        added = index_place(collection, model, place_name, source_url, reviews)
         if added:
             indexed += 1
             log.info(f"  ✓ {added} yorum eklendi.")

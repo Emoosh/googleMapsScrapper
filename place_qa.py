@@ -1,7 +1,8 @@
 """
 place_qa.py
 -----------
-RAG mikroservisi: ChromaDB'den ilgili yorumları çekip Gemini ile cevap üretir.
+RAG mikroservisi: ChromaDB'den ilgili yorumları çekip Claude Haiku ile cevap üretir.
+Embedding local olarak intfloat/multilingual-e5-large modeli ile yapılır.
 
 Önce indexer.py çalıştırılmalı!
 
@@ -17,10 +18,11 @@ import os
 import logging
 import sys
 
+import torch
+from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from google import genai
 import anthropic
 import chromadb
 
@@ -38,21 +40,36 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 load_dotenv()
-GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 CLAUDE_MODEL      = "claude-haiku-4-5-20251001"
-EMBED_MODEL     = "gemini-embedding-001"
-CHROMA_PATH     = "./chroma_db"
-COLLECTION_NAME = "place_reviews"
-DEFAULT_TOP_K   = 12
+EMBED_MODEL       = "intfloat/multilingual-e5-large"
+CHROMA_PATH       = "./chroma_db"
+COLLECTION_NAME   = "place_reviews"
+DEFAULT_TOP_K     = 6
+
+SYSTEM_PROMPT = (
+    "Sen bir mekan değerlendirme asistanısın. "
+    "Yalnızca sana verilen Google Maps yorumlarına dayanarak soruları Türkçe yanıtla. "
+    "Yorumlarda cevap yoksa 'Bu konuda yorumlarda yeterli bilgi bulunamadı.' de. "
+    "Kısa, net ve doğrudan cevap ver."
+)
+
+# CUDA > MPS > CPU otomatik seçim
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
 
 # ---------------------------------------------------------------------------
 # Singletons (uygulama başlarken bir kez init edilir)
 # ---------------------------------------------------------------------------
-gemini_client   = genai.Client(api_key=GEMINI_API_KEY)
+log.info(f"Embedding modeli yükleniyor: {EMBED_MODEL} ({DEVICE})")
+embed_model      = SentenceTransformer(EMBED_MODEL, device=DEVICE)
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-chroma_client   = chromadb.PersistentClient(path=CHROMA_PATH)
-collection    = chroma_client.get_or_create_collection(
+chroma_client    = chromadb.PersistentClient(path=CHROMA_PATH)
+collection       = chroma_client.get_or_create_collection(
     name=COLLECTION_NAME,
     metadata={"hnsw:space": "cosine"},
 )
@@ -80,18 +97,9 @@ class AskResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def build_prompt(place_name: str, question: str, reviews: list[str]) -> str:
-    reviews_text = "\n".join(f"{i+1}. {r}" for i, r in enumerate(reviews))
-    return f"""Aşağıdaki yorumlar '{place_name}' adlı mekana ait Google Maps yorumlarıdır.
-Yalnızca bu yorumlara dayanarak kullanıcının sorusunu Türkçe olarak yanıtla.
-Yorumlarda cevap yoksa "Bu konuda yorumlarda yeterli bilgi bulunamadı." de.
-Kısa, net ve doğrudan cevap ver.
-
-Soru: {question}
-
-Yorumlar:
-{reviews_text}
-"""
+def build_user_message(place_name: str, question: str, reviews: list[str]) -> str:
+    reviews_text = "\n".join(f"{i+1}. {r[:200]}" for i, r in enumerate(reviews))
+    return f"Mekan: {place_name}\nSoru: {question}\n\nYorumlar:\n{reviews_text}"
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +110,7 @@ Yorumlar:
 def health():
     return {
         "status": "ok",
+        "device": DEVICE,
         "collection": COLLECTION_NAME,
         "total_indexed_reviews": collection.count(),
     }
@@ -109,12 +118,11 @@ def health():
 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
-    # 1. Soruyu embed et
-    embed_result = gemini_client.models.embed_content(
-        model=EMBED_MODEL,
-        contents=req.question,
-    )
-    question_embedding = embed_result.embeddings[0].values
+    # 1. Soruyu local model ile embed et (multilingual-e5 için "query: " prefix'i)
+    question_embedding = embed_model.encode(
+        f"query: {req.question}",
+        normalize_embeddings=True,
+    ).tolist()
 
     # 2. ChromaDB'de o mekana ait en alakalı yorumları çek
     results = collection.query(
@@ -130,18 +138,20 @@ def ask(req: AskRequest):
             detail=f"'{req.place_name}' için indexli yorum bulunamadı. Önce indexer.py çalıştırın.",
         )
 
-    # 3. Claude ile cevap üret
+    # 3. Claude Haiku ile cevap üret
     message = anthropic_client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=1024,
-        messages=[{"role": "user", "content": build_prompt(req.place_name, req.question, reviews)}],
+        max_tokens=512,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": build_user_message(req.place_name, req.question, reviews)}],
     )
 
+    answer = message.content[0].text.strip()
     log.info(f"[/ask] '{req.place_name}' | soru: '{req.question}' | {len(reviews)} kaynak yorum")
 
     return AskResponse(
         place_name=req.place_name,
         question=req.question,
-        answer=message.content[0].text.strip(),
+        answer=answer,
         sources_used=len(reviews),
     )

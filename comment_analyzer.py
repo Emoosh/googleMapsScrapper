@@ -2,27 +2,26 @@
 comment_analyzer.py
 -------------------
 Mikroservis: scraped_data.json dosyasını okur, her mekan için
-Gemini API ile yorum analizi yapar ve analyzed_data.json olarak kaydeder.
+local Ollama (qwen2.5:14b) ile yorum analizi yapar ve analyzed_data.json olarak kaydeder.
 
 Kullanım:
     python comment_analyzer.py
     python comment_analyzer.py --input baska_dosya.json --output sonuc.json
     python comment_analyzer.py --dry-run   # API çağrısı yapmadan yapıyı test et
+    python comment_analyzer.py --model qwen2.5:32b  # farklı model
 """
 
 import json
 import os
 import re
-import time
 import argparse
 import logging
 import sys
 from pathlib import Path
 from datetime import datetime, UTC
-from dotenv import load_dotenv
 from urllib.parse import unquote
 
-from google import genai
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -40,12 +39,9 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL   = "gemini-3-flash-preview"
-RATE_LIMIT_DELAY = 1.5   # saniye — mekanlar arası bekleme
-MAX_RETRIES      = 3
-RETRY_DELAY      = 5     # saniye — hata sonrası bekleme
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+DEFAULT_MODEL   = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
+MAX_RETRIES     = 3
 
 TARGET_SCHEMA = {
     "place_name": "string",
@@ -70,28 +66,39 @@ TARGET_SCHEMA = {
     "fiyat_seviyesi": "ucuz | orta | orta-üst | pahalı | belirtilmemiş",
 }
 
+SYSTEM_PROMPT = (
+    "Sen bir mekan analiz asistanısın. "
+    "Sana verilen Google Maps yorumlarını analiz edip YALNIZCA geçerli bir JSON objesi döndür. "
+    "Başka hiçbir şey yazma. Markdown, açıklama veya kod bloğu kullanma."
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def clean_gemini_response(raw: str) -> str:
-    """Gemini bazen ```json ``` bloğu döndürür — temizle."""
+def extract_place_name(entry: dict) -> str:
+    if entry.get("place_name"):
+        return entry["place_name"]
+    url = entry.get("url", "")
+    match = re.search(r"/place/([^/]+)", url)
+    if match:
+        return unquote(match.group(1).replace("+", " "))
+    return "Bilinmeyen Mekan"
+
+
+def clean_response(raw: str) -> str:
+    """Model bazen ```json ``` bloğu döndürür — temizle."""
     raw = raw.strip()
     raw = re.sub(r"^```(?:json)?", "", raw).strip()
     raw = re.sub(r"```$", "", raw).strip()
     return raw
 
 
-def build_prompt(place_name: str, reviews: list[str]) -> str:
+def build_user_message(place_name: str, reviews: list[str]) -> str:
     reviews_text = "\n".join(f"{i+1}. {r}" for i, r in enumerate(reviews))
     schema_str   = json.dumps(TARGET_SCHEMA, ensure_ascii=False, indent=2)
-
-    return f"""
-Aşağıdaki mekan yorumlarını analiz et ve YALNIZCA geçerli bir JSON objesi döndür.
-Başka hiçbir şey yazma. Markdown, açıklama veya kod bloğu kullanma.
-
-Mekan adı: {place_name}
+    return f"""Mekan adı: {place_name}
 
 Yorumlar:
 {reviews_text}
@@ -107,8 +114,7 @@ Kurallar:
 - populer_urunler: yorumlarda adı geçen yiyecek/içecekler
 - etiketler: mekanı tanımlayan kısa kelimeler (örn: "cozy", "bahçeli", "çalışma dostu")
 - fiyat_seviyesi: yorumlardaki ipuçlarına göre kategorize et
-- analyzed_at ve source_url alanlarını boş bırak, kod dolduracak
-"""
+- analyzed_at ve source_url alanlarını boş bırak, kod dolduracak"""
 
 
 # ---------------------------------------------------------------------------
@@ -116,13 +122,12 @@ Kurallar:
 # ---------------------------------------------------------------------------
 
 def analyze_single(
-    model,
+    client: OpenAI,
+    model: str,
     place_name: str,
     reviews: list[str],
     dry_run: bool = False,
 ) -> dict:
-    """Tek bir mekanı analiz eder, ham dict döndürür."""
-
     if dry_run:
         log.info(f"  [dry-run] '{place_name}' için API çağrısı atlanıyor.")
         return {
@@ -138,53 +143,38 @@ def analyze_single(
             "fiyat_seviyesi": "belirtilmemiş",
         }
 
-    prompt = build_prompt(place_name, reviews)
-
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = model.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": build_user_message(place_name, reviews)},
+                ],
+                temperature=0.1,
             )
-            raw      = clean_gemini_response(response.text)
-            parsed   = json.loads(raw)
+            raw    = clean_response(response.choices[0].message.content)
+            parsed = json.loads(raw)
             return parsed
+
         except json.JSONDecodeError as e:
             log.warning(f"  JSON parse hatası (deneme {attempt}/{MAX_RETRIES}): {e}")
-            wait = RETRY_DELAY
         except Exception as e:
-            err_str = str(e)
-            log.warning(f"  API hatası (deneme {attempt}/{MAX_RETRIES}): {e}")
+            log.warning(f"  Hata (deneme {attempt}/{MAX_RETRIES}): {e}")
 
-            # 429 ise API'nin önerdiği retryDelay'i kullan
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                retry_match = re.search(r"retryDelay.*?(\d+)s", err_str)
-                wait = int(retry_match.group(1)) + 2 if retry_match else 60
-                log.info(f"  Kota aşıldı — {wait}s bekleniyor (API önerisi)...")
-            else:
-                wait = RETRY_DELAY
+        if attempt == MAX_RETRIES:
+            raise RuntimeError(f"'{place_name}' için {MAX_RETRIES} denemede de analiz başarısız.")
 
-        if attempt < MAX_RETRIES:
-            log.info(f"  {wait}s beklenip tekrar deneniyor...")
-            time.sleep(wait)
+        log.info(f"  Tekrar deneniyor...")
 
-    raise RuntimeError(f"'{place_name}' için {MAX_RETRIES} denemede de analiz başarısız.")
+    raise RuntimeError(f"'{place_name}' analiz başarısız.")
 
-def extract_place_name(entry: dict) -> str:
-    if entry.get("place_name"):
-        return entry["place_name"]
-    url = entry.get("url", "")
-    match = re.search(r"/place/([^/]+)", url)
-    if match:
-        raw_name = match.group(1).replace("+", " ")
-        return unquote(raw_name)  # %C3%BC → ü
-    return "Bilinmeyen Mekan"
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run(input_path: str, output_path: str, dry_run: bool = False):
-    # --- Girdi dosyasını oku ---
+def run(input_path: str, output_path: str, model: str, dry_run: bool = False):
     input_file = Path(input_path)
     if not input_file.exists():
         log.error(f"Girdi dosyası bulunamadı: {input_file}")
@@ -200,22 +190,13 @@ def run(input_path: str, output_path: str, dry_run: bool = False):
     total = len(scraped_data)
     log.info(f"{total} mekan bulundu → analiz başlıyor.")
 
-    # --- Gemini istemcisini başlat ---
+    client = None
     if not dry_run:
-        if not GEMINI_API_KEY:
-            log.error(
-                "GEMINI_API_KEY bulunamadı!\n"
-                ".env dosyanızın proje klasöründe olduğundan ve şu satırı içerdiğinden emin olun:\n"
-                "  GEMINI_API_KEY=AIzaSy..."
-            )
-            sys.exit(1)
-        model = genai.Client(api_key=GEMINI_API_KEY)
-        log.info(f"Gemini client başlatıldı. Model: {GEMINI_MODEL}")
-    else:
-        model = None
-    # --- Her mekanı işle ---
-    results      = []
-    failed       = []
+        client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+        log.info(f"Ollama bağlantısı: {OLLAMA_BASE_URL} | Model: {model}")
+
+    results = []
+    failed  = []
 
     for idx, entry in enumerate(scraped_data, start=1):
         place_name = extract_place_name(entry)
@@ -224,14 +205,13 @@ def run(input_path: str, output_path: str, dry_run: bool = False):
         log.info(f"[{idx}/{total}] '{place_name}' — {len(reviews)} yorum")
 
         if not reviews:
-            log.warning(f"  Yorum bulunamadı, atlanıyor.")
+            log.warning("  Yorum bulunamadı, atlanıyor.")
             failed.append({"place_name": place_name, "reason": "yorum yok"})
             continue
 
         try:
-            result = analyze_single(model, place_name, reviews, dry_run=dry_run)
+            result = analyze_single(client, model, place_name, reviews, dry_run=dry_run)
 
-            # Kod tarafından doldurulan alanlar
             result["place_name"]            = place_name
             result["source_url"]            = entry.get("url", "")
             result["total_reviews_scraped"] = entry.get("total_reviews_scraped", len(reviews))
@@ -244,11 +224,6 @@ def run(input_path: str, output_path: str, dry_run: bool = False):
             log.error(f"  ✗ {e}")
             failed.append({"place_name": place_name, "reason": str(e)})
 
-        # Rate limit — son mekan değilse bekle
-        if idx < total and not dry_run:
-            time.sleep(RATE_LIMIT_DELAY)
-
-    # --- Çıktıyı kaydet ---
     output_file = Path(output_path)
     output_payload = {
         "generated_at": datetime.now(UTC).isoformat(),
@@ -275,22 +250,15 @@ def run(input_path: str, output_path: str, dry_run: bool = False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kafe yorum analiz mikroservisi")
-    parser.add_argument(
-        "--input",  default="scraped_data.json",
-        help="Girdi dosyası (varsayılan: scraped_data.json)"
-    )
-    parser.add_argument(
-        "--output", default="analyzed_data.json",
-        help="Çıktı dosyası (varsayılan: analyzed_data.json)"
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="API çağrısı yapmadan pipeline'ı test et"
-    )
+    parser.add_argument("--input",   default="scraped_data.json")
+    parser.add_argument("--output",  default="analyzed_data.json")
+    parser.add_argument("--model",   default=DEFAULT_MODEL, help="Ollama model adı")
+    parser.add_argument("--dry-run", action="store_true", help="API çağrısı yapmadan test et")
     args = parser.parse_args()
 
     run(
         input_path=args.input,
         output_path=args.output,
+        model=args.model,
         dry_run=args.dry_run,
     )
