@@ -1,0 +1,11 @@
+anthropic
+chromadb
+fastapi
+openai
+playwright
+pydantic
+python-dotenv
+redis
+sentence-transformers
+torch
+uvicorn

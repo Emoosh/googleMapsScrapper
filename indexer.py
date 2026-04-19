@@ -18,9 +18,12 @@ import logging
 import argparse
 import hashlib
 import re
+import threading
 from pathlib import Path
 from urllib.parse import unquote
 
+import redis
+from fastapi import FastAPI
 from sentence_transformers import SentenceTransformer
 import torch
 import chromadb
@@ -39,7 +42,7 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 EMBED_MODEL     = "intfloat/multilingual-e5-large"
-CHROMA_PATH     = "./chroma_db"
+CHROMA_PATH     = os.getenv("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = "place_reviews"
 
 # CUDA > MPS > CPU otomatik seçim
@@ -177,9 +180,128 @@ def run(input_path: str, reset: bool = False):
 # CLI
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# FastAPI mikroservis
+# ---------------------------------------------------------------------------
+
+INDEXER_INPUT = os.getenv("INDEXER_INPUT", "scraped_data.json")
+REDIS_URL     = os.getenv("REDIS_URL", "redis://localhost:6379")
+QUEUE_NAME    = "queue:places:indexer"
+
+fa_app = FastAPI(title="Indexer Mikroservisi")
+
+_job: dict = {"status": "idle", "detail": ""}
+_lock = threading.Lock()
+_worker_stats: dict = {"processed": 0, "failed": 0, "running": False}
+
+
+@fa_app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@fa_app.post("/run")
+def trigger(reset: bool = False):
+    with _lock:
+        if _job["status"] == "running":
+            return {"status": "already_running"}
+        _job.update({"status": "running", "detail": ""})
+
+    def _task():
+        try:
+            run(INDEXER_INPUT, reset=reset)
+            with _lock:
+                _job["status"] = "done"
+        except Exception as e:
+            with _lock:
+                _job.update({"status": "error", "detail": str(e)})
+
+    threading.Thread(target=_task, daemon=True).start()
+    return {"status": "started", "input": INDEXER_INPUT, "chroma_path": CHROMA_PATH}
+
+
+@fa_app.get("/status")
+def status():
+    return _job
+
+
+# ---------------------------------------------------------------------------
+# Redis queue worker
+# ---------------------------------------------------------------------------
+
+def _worker_loop():
+    log.info(f"[worker] Indexer Redis worker başladı — kuyruk: {QUEUE_NAME}")
+    model = SentenceTransformer(EMBED_MODEL, device=DEVICE)
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+    chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+    collection = chroma_client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+    while _worker_stats["running"]:
+        item = r.brpop(QUEUE_NAME, timeout=5)
+        if item is None:
+            continue
+
+        _, raw = item
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            log.error("[worker] Geçersiz JSON, atlanıyor.")
+            continue
+
+        place_name = entry.get("name") or extract_place_name(entry)
+        reviews    = entry.get("reviews", [])
+        source_url = entry.get("url", "")
+
+        log.info(f"[worker] İndeksleniyor: '{place_name}' — {len(reviews)} yorum")
+
+        if not reviews:
+            _worker_stats["failed"] += 1
+            continue
+
+        added = index_place(collection, model, place_name, source_url, reviews)
+        if added:
+            _worker_stats["processed"] += 1
+            log.info(f"[worker] ✓ '{place_name}' — {added} yorum eklendi.")
+        else:
+            log.info(f"[worker] '{place_name}' zaten indexli, atlandı.")
+
+    log.info("[worker] Indexer worker durduruldu.")
+
+
+@fa_app.post("/worker/stop")
+def worker_stop():
+    _worker_stats["running"] = False
+    return {"status": "stopping"}
+
+
+@fa_app.get("/worker/status")
+def worker_status():
+    pending = 0
+    try:
+        r = redis.from_url(REDIS_URL, decode_responses=True)
+        pending = r.llen(QUEUE_NAME)
+    except Exception:
+        pass
+    return {**_worker_stats, "queue_pending": pending}
+
+
+@fa_app.on_event("startup")
+def auto_start_worker():
+    _worker_stats["running"] = True
+    threading.Thread(target=_worker_loop, daemon=True).start()
+    log.info("[startup] Indexer Redis worker otomatik başlatıldı.")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ChromaDB review indexer")
-    parser.add_argument("--input", default="scraped_data.json")
+    parser.add_argument("--input", default=INDEXER_INPUT)
     parser.add_argument("--reset", action="store_true", help="Mevcut DB'yi sıfırla")
     args = parser.parse_args()
     run(args.input, reset=args.reset)

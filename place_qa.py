@@ -15,6 +15,7 @@ Endpoint'ler:
 """
 
 import os
+import re
 import logging
 import sys
 
@@ -23,7 +24,7 @@ from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import anthropic
+from openai import OpenAI
 import chromadb
 
 # ---------------------------------------------------------------------------
@@ -40,18 +41,19 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 load_dotenv()
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-CLAUDE_MODEL      = "claude-haiku-4-5-20251001"
-EMBED_MODEL       = "intfloat/multilingual-e5-large"
-CHROMA_PATH       = "./chroma_db"
-COLLECTION_NAME   = "place_reviews"
-DEFAULT_TOP_K     = 6
+LLM_BASE_URL  = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
+LLM_MODEL     = os.getenv("LLM_MODEL", "turkish-gemma")
+EMBED_MODEL   = "intfloat/multilingual-e5-large"
+CHROMA_PATH   = os.getenv("CHROMA_PATH", "./chroma_db")
+COLLECTION_NAME = "place_reviews"
+DEFAULT_TOP_K   = 6
 
 SYSTEM_PROMPT = (
     "Sen bir mekan değerlendirme asistanısın. "
-    "Yalnızca sana verilen Google Maps yorumlarına dayanarak soruları Türkçe yanıtla. "
-    "Yorumlarda cevap yoksa 'Bu konuda yorumlarda yeterli bilgi bulunamadı.' de. "
-    "Kısa, net ve doğrudan cevap ver."
+    "Yalnızca verilen Google Maps yorumlarına dayanarak Türkçe yanıtla. "
+    "Yorumlarda bilgi yoksa tek cümleyle 'Bu konuda yorumlarda bilgi bulunamadı.' de. "
+    "Yorumlarda bilgi varsa 2-3 cümleyle özetle. "
+    "Asla düşünce sürecini yazma, doğrudan cevabı ver."
 )
 
 # CUDA > MPS > CPU otomatik seçim
@@ -66,13 +68,15 @@ else:
 # Singletons (uygulama başlarken bir kez init edilir)
 # ---------------------------------------------------------------------------
 log.info(f"Embedding modeli yükleniyor: {EMBED_MODEL} ({DEVICE})")
-embed_model      = SentenceTransformer(EMBED_MODEL, device=DEVICE)
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-chroma_client    = chromadb.PersistentClient(path=CHROMA_PATH)
-collection       = chroma_client.get_or_create_collection(
-    name=COLLECTION_NAME,
-    metadata={"hnsw:space": "cosine"},
-)
+embed_model = SentenceTransformer(EMBED_MODEL, device=DEVICE)
+llm_client  = OpenAI(base_url=LLM_BASE_URL, api_key="dummy")
+
+def get_collection():
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    return client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
+    )
 
 app = FastAPI(title="Place Q&A Mikroservisi")
 
@@ -112,12 +116,14 @@ def health():
         "status": "ok",
         "device": DEVICE,
         "collection": COLLECTION_NAME,
-        "total_indexed_reviews": collection.count(),
+        "total_indexed_reviews": get_collection().count(),
     }
 
 
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
+    collection = get_collection()
+
     # 1. Soruyu local model ile embed et (multilingual-e5 için "query: " prefix'i)
     question_embedding = embed_model.encode(
         f"query: {req.question}",
@@ -125,9 +131,17 @@ def ask(req: AskRequest):
     ).tolist()
 
     # 2. ChromaDB'de o mekana ait en alakalı yorumları çek
+    existing = collection.get(where={"place_name": req.place_name}, limit=1)
+    if not existing["ids"]:
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{req.place_name}' için indexli yorum bulunamadı.",
+        )
+    place_docs = collection.get(where={"place_name": req.place_name})
+    n = min(req.top_k, len(place_docs["ids"]))
     results = collection.query(
         query_embeddings=[question_embedding],
-        n_results=req.top_k,
+        n_results=n,
         where={"place_name": req.place_name},
     )
 
@@ -138,15 +152,23 @@ def ask(req: AskRequest):
             detail=f"'{req.place_name}' için indexli yorum bulunamadı. Önce indexer.py çalıştırın.",
         )
 
-    # 3. Claude Haiku ile cevap üret
-    message = anthropic_client.messages.create(
-        model=CLAUDE_MODEL,
+    # 3. Local LLM ile cevap üret
+    response = llm_client.chat.completions.create(
+        model=LLM_MODEL,
         max_tokens=512,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": build_user_message(req.place_name, req.question, reviews)}],
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_message(req.place_name, req.question, reviews)},
+        ],
+        temperature=0.1,
     )
 
-    answer = message.content[0].text.strip()
+    raw = response.choices[0].message.content or ""
+    # kapalı <think> bloğunu sil, kapatılmamışsa <think>'den sona kadar sil
+    if "</think>" in raw:
+        answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    else:
+        answer = re.sub(r"<think>.*", "", raw, flags=re.DOTALL).strip()
     log.info(f"[/ask] '{req.place_name}' | soru: '{req.question}' | {len(reviews)} kaynak yorum")
 
     return AskResponse(

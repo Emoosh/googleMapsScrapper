@@ -17,10 +17,13 @@ import re
 import argparse
 import logging
 import sys
+import threading
 from pathlib import Path
 from datetime import datetime, UTC
 from urllib.parse import unquote
 
+import redis
+from fastapi import FastAPI
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
@@ -39,8 +42,8 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-DEFAULT_MODEL   = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
+LLM_BASE_URL  = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
+DEFAULT_MODEL = os.getenv("LLM_MODEL", "turkish-gemma")
 MAX_RETRIES     = 3
 
 TARGET_SCHEMA = {
@@ -88,15 +91,23 @@ def extract_place_name(entry: dict) -> str:
 
 
 def clean_response(raw: str) -> str:
-    """Model bazen ```json ``` bloğu döndürür — temizle."""
+    """<think> bloğunu, markdown sarmalayıcıları ve baştaki/sondaki boşlukları temizle."""
     raw = raw.strip()
+    # Reasoning modeli <think>...</think> bloğu ekliyor — soy
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    # Markdown kod bloğu sarmalayıcıları
     raw = re.sub(r"^```(?:json)?", "", raw).strip()
     raw = re.sub(r"```$", "", raw).strip()
     return raw
 
 
+MAX_REVIEWS    = 25   # token limitine göre gönderilecek max yorum sayısı
+MAX_REVIEW_LEN = 200  # her yorumun max karakter uzunluğu
+
+
 def build_user_message(place_name: str, reviews: list[str]) -> str:
-    reviews_text = "\n".join(f"{i+1}. {r}" for i, r in enumerate(reviews))
+    truncated = [r[:MAX_REVIEW_LEN] for r in reviews[:MAX_REVIEWS]]
+    reviews_text = "\n".join(f"{i+1}. {r}" for i, r in enumerate(truncated))
     schema_str   = json.dumps(TARGET_SCHEMA, ensure_ascii=False, indent=2)
     return f"""Mekan adı: {place_name}
 
@@ -152,8 +163,10 @@ def analyze_single(
                     {"role": "user",   "content": build_user_message(place_name, reviews)},
                 ],
                 temperature=0.1,
+                max_tokens=1024,
             )
-            raw    = clean_response(response.choices[0].message.content)
+            raw = clean_response(response.choices[0].message.content or "")
+            log.debug(f"  RAW response: {repr(raw[:300])}")
             parsed = json.loads(raw)
             return parsed
 
@@ -192,8 +205,8 @@ def run(input_path: str, output_path: str, model: str, dry_run: bool = False):
 
     client = None
     if not dry_run:
-        client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
-        log.info(f"Ollama bağlantısı: {OLLAMA_BASE_URL} | Model: {model}")
+        client = OpenAI(base_url=LLM_BASE_URL, api_key="dummy")
+        log.info(f"vLLM bağlantısı: {LLM_BASE_URL} | Model: {model}")
 
     results = []
     failed  = []
@@ -248,11 +261,168 @@ def run(input_path: str, output_path: str, model: str, dry_run: bool = False):
 # CLI
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# FastAPI mikroservis
+# ---------------------------------------------------------------------------
+
+ANALYZER_INPUT  = os.getenv("ANALYZER_INPUT",  "scraped_data.json")
+ANALYZER_OUTPUT = os.getenv("ANALYZER_OUTPUT", "analyzed_data.json")
+REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379")
+QUEUE_NAME      = "queue:places:analyzer"
+
+fa_app = FastAPI(title="Comment Analyzer Mikroservisi")
+
+_job: dict = {"status": "idle", "detail": ""}
+_lock = threading.Lock()
+_worker_running = False
+
+
+@fa_app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@fa_app.post("/run")
+def trigger(model: str = DEFAULT_MODEL):
+    with _lock:
+        if _job["status"] == "running":
+            return {"status": "already_running"}
+        _job.update({"status": "running", "detail": ""})
+
+    def _task():
+        try:
+            run(ANALYZER_INPUT, ANALYZER_OUTPUT, model)
+            with _lock:
+                _job["status"] = "done"
+        except Exception as e:
+            with _lock:
+                _job.update({"status": "error", "detail": str(e)})
+
+    threading.Thread(target=_task, daemon=True).start()
+    return {"status": "started", "input": ANALYZER_INPUT, "output": ANALYZER_OUTPUT}
+
+
+@fa_app.get("/status")
+def status():
+    with _lock:
+        return dict(_job)
+
+
+# ---------------------------------------------------------------------------
+# Redis queue worker
+# ---------------------------------------------------------------------------
+
+_worker_stats: dict = {"processed": 0, "failed": 0, "running": False}
+
+
+def _append_to_output(result: dict, output_path: str):
+    path = Path(output_path)
+    if path.exists():
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+    else:
+        payload = {"data": [], "successful": 0, "failed": 0}
+
+    payload["data"].append(result)
+    payload["successful"] = len(payload["data"])
+    payload["generated_at"] = datetime.now(UTC).isoformat()
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _worker_loop(model: str, output_path: str):
+    log.info(f"[worker] Redis worker başladı — kuyruk: {QUEUE_NAME}")
+    client = OpenAI(base_url=LLM_BASE_URL, api_key="dummy")
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+
+    while _worker_stats["running"]:
+        item = r.brpop(QUEUE_NAME, timeout=5)  # 5s bekle, yoksa döngüye dön
+        if item is None:
+            continue
+
+        _, raw = item
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            log.error("[worker] Geçersiz JSON, atlanıyor.")
+            continue
+
+        place_name = entry.get("name") or extract_place_name(entry)
+        reviews    = entry.get("reviews", [])
+
+        log.info(f"[worker] İşleniyor: '{place_name}' — {len(reviews)} yorum")
+
+        if not reviews:
+            log.warning(f"[worker] '{place_name}' için yorum yok, atlanıyor.")
+            _worker_stats["failed"] += 1
+            continue
+
+        try:
+            result = analyze_single(client, model, place_name, reviews)
+            result["place_name"]            = place_name
+            result["source_url"]            = entry.get("url", "")
+            result["total_reviews_scraped"] = entry.get("total_reviews_scraped", len(reviews))
+            result["analyzed_at"]           = datetime.now(UTC).isoformat()
+
+            _append_to_output(result, output_path)
+            _worker_stats["processed"] += 1
+            log.info(f"[worker] ✓ '{place_name}' — genel puan: {result.get('genel_puan', '?')}")
+
+        except RuntimeError as e:
+            log.error(f"[worker] ✗ '{place_name}': {e}")
+            _worker_stats["failed"] += 1
+
+    log.info("[worker] Worker durduruldu.")
+
+
+@fa_app.post("/worker/start")
+def worker_start(model: str = DEFAULT_MODEL):
+    global _worker_running
+    if _worker_stats["running"]:
+        return {"status": "already_running"}
+    _worker_stats["running"] = True
+    threading.Thread(target=_worker_loop, args=(model, ANALYZER_OUTPUT), daemon=True).start()
+    return {"status": "started"}
+
+
+@fa_app.post("/worker/stop")
+def worker_stop():
+    _worker_stats["running"] = False
+    return {"status": "stopping"}
+
+
+@fa_app.get("/worker/status")
+def worker_status():
+    pending = 0
+    try:
+        r = redis.from_url(REDIS_URL, decode_responses=True)
+        pending = r.llen(QUEUE_NAME)
+    except Exception:
+        pass
+    return {**_worker_stats, "queue_pending": pending}
+
+
+@fa_app.on_event("startup")
+def auto_start_worker():
+    _worker_stats["running"] = True
+    threading.Thread(
+        target=_worker_loop,
+        args=(DEFAULT_MODEL, ANALYZER_OUTPUT),
+        daemon=True,
+    ).start()
+    log.info("[startup] Redis worker otomatik başlatıldı.")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kafe yorum analiz mikroservisi")
-    parser.add_argument("--input",   default="scraped_data.json")
-    parser.add_argument("--output",  default="analyzed_data.json")
-    parser.add_argument("--model",   default=DEFAULT_MODEL, help="Ollama model adı")
+    parser.add_argument("--input",   default=ANALYZER_INPUT)
+    parser.add_argument("--output",  default=ANALYZER_OUTPUT)
+    parser.add_argument("--model",   default=DEFAULT_MODEL, help="vLLM model adı (served-model-name)")
     parser.add_argument("--dry-run", action="store_true", help="API çağrısı yapmadan test et")
     args = parser.parse_args()
 
