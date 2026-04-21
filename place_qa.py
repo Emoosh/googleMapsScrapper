@@ -41,8 +41,8 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 load_dotenv()
-LLM_BASE_URL  = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
-LLM_MODEL     = os.getenv("LLM_MODEL", "turkish-gemma")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
+LLM_MODEL    = os.getenv("LLM_MODEL", "turkish-gemma")
 EMBED_MODEL   = "intfloat/multilingual-e5-large"
 CHROMA_PATH   = os.getenv("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = "place_reviews"
@@ -69,7 +69,7 @@ else:
 # ---------------------------------------------------------------------------
 log.info(f"Embedding modeli yükleniyor: {EMBED_MODEL} ({DEVICE})")
 embed_model = SentenceTransformer(EMBED_MODEL, device=DEVICE)
-llm_client  = OpenAI(base_url=LLM_BASE_URL, api_key="dummy")
+llm_client = OpenAI(base_url=LLM_BASE_URL, api_key="dummy")
 
 def get_collection():
     client = chromadb.PersistentClient(path=CHROMA_PATH)
@@ -156,15 +156,13 @@ def ask(req: AskRequest):
     response = llm_client.chat.completions.create(
         model=LLM_MODEL,
         max_tokens=512,
+        temperature=0.1,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_user_message(req.place_name, req.question, reviews)},
         ],
-        temperature=0.1,
     )
-
     raw = response.choices[0].message.content or ""
-    # kapalı <think> bloğunu sil, kapatılmamışsa <think>'den sona kadar sil
     if "</think>" in raw:
         answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     else:

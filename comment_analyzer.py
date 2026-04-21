@@ -91,13 +91,16 @@ def extract_place_name(entry: dict) -> str:
 
 
 def clean_response(raw: str) -> str:
-    """<think> bloğunu, markdown sarmalayıcıları ve baştaki/sondaki boşlukları temizle."""
     raw = raw.strip()
-    # Reasoning modeli <think>...</think> bloğu ekliyor — soy
     raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-    # Markdown kod bloğu sarmalayıcıları
     raw = re.sub(r"^```(?:json)?", "", raw).strip()
     raw = re.sub(r"```$", "", raw).strip()
+    # Trailing commas before } or ]
+    raw = re.sub(r",\s*([}\]])", r"\1", raw)
+    # JSON objesini bul (LLM bazen önüne/arkasına metin ekler)
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        raw = match.group(0)
     return raw
 
 
@@ -105,13 +108,21 @@ MAX_REVIEWS    = 25   # token limitine göre gönderilecek max yorum sayısı
 MAX_REVIEW_LEN = 200  # her yorumun max karakter uzunluğu
 
 
+def _max_score_for_review_count(n: int) -> float:
+    if n <= 10:   return 7.0
+    if n <= 30:   return 8.0
+    if n <= 50:  return 9.0
+    return 10.0
+
+
 def build_user_message(place_name: str, reviews: list[str]) -> str:
     truncated = [r[:MAX_REVIEW_LEN] for r in reviews[:MAX_REVIEWS]]
     reviews_text = "\n".join(f"{i+1}. {r}" for i, r in enumerate(truncated))
     schema_str   = json.dumps(TARGET_SCHEMA, ensure_ascii=False, indent=2)
+    max_score    = _max_score_for_review_count(len(truncated))
     return f"""Mekan adı: {place_name}
 
-Yorumlar:
+Yorumlar ({len(truncated)} adet):
 {reviews_text}
 
 Döndürmen gereken JSON formatı:
@@ -119,6 +130,7 @@ Döndürmen gereken JSON formatı:
 
 Kurallar:
 - Tüm puanlar 1-10 arasında float (örn: 8.5)
+- Bu mekan için maksimum verebileceğin puan {max_score}'dir çünkü yalnızca {len(truncated)} yorum var; az yorumla yüksek güven olmaz
 - ozet: 2-3 cümle, nesnel, yalnızca yorumlara dayalı
 - one_cikanlar: en fazla 5 madde, yorumlarda geçen güçlü yönler
 - eksiler: yorumlarda geçen somut şikayetler; yoksa boş liste []
@@ -163,7 +175,7 @@ def analyze_single(
                     {"role": "user",   "content": build_user_message(place_name, reviews)},
                 ],
                 temperature=0.1,
-                max_tokens=1024,
+                max_tokens=2048,
             )
             raw = clean_response(response.choices[0].message.content or "")
             log.debug(f"  RAW response: {repr(raw[:300])}")
