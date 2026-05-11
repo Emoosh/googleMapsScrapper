@@ -1,10 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 anthropic
 chromadb
 fastapi
 playwright
+psycopg2-binary
 pydantic
 python-dotenv
 redis
 sentence-transformers
 torch
-uvicorn
+uvicorn[standard]

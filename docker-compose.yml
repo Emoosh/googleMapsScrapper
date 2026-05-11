@@ -3,6 +3,7 @@ services:
   # ─── POSTGRES + POSTGIS ─────────────────────────────────────────────────────
   db:
     image: postgis/postgis:16-3.4-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB:       ${POSTGRES_DB:-neredenevar}
       POSTGRES_USER:     ${POSTGRES_USER:-app}
@@ -17,10 +18,16 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ─── REDIS ──────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "6379:6379"
     healthcheck:
@@ -28,12 +35,36 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ─── TOR PROXY ──────────────────────────────────────────────────────────────
+  tor:
+    image: dperson/torproxy:latest
+    restart: unless-stopped
+    environment:
+      - PASSWORD=torpass
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sx socks5h://localhost:9050 https://check.torproject.org/api/ip | grep -q '\"IsTor\":true'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ─── SCRAPER ────────────────────────────────────────────────────────────────
   scraper:
     build:
       context: .
       dockerfile: Dockerfile.scraper
+    restart: unless-stopped
     ports:
       - "8080:8080"
     volumes:
@@ -41,22 +72,63 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      tor:
+        condition: service_healthy
     environment:
       - SCRAPER_OUTPUT=/data/scraped_data.json
       - HEADLESS=true
       - REDIS_URL=redis://redis:6379
+      - PROXY_URL=socks5://tor:9050
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/docs"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ─── SCRAPER WORKER ─────────────────────────────────────────────────────────
+  # Paralel scraping için: docker compose up --scale scraper-worker=3
+  scraper-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.scraper
+    restart: unless-stopped
+    command: uvicorn scraper_worker:app --host 0.0.0.0 --port 8085
+    volumes:
+      - data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      tor:
+        condition: service_healthy
+    environment:
+      - HEADLESS=true
+      - REDIS_URL=redis://redis:6379
+      - PROXY_URL=socks5://tor:9050
+      - SCRAPER_OUTPUT=/data/scraped_data.json
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
 
   # ─── ANALYZER ───────────────────────────────────────────────────────────────
   analyzer:
     build:
       context: .
       dockerfile: Dockerfile.ml
+    restart: unless-stopped
     command: uvicorn comment_analyzer:fa_app --host 0.0.0.0 --port 8081
     ports:
       - "8081:8081"
@@ -78,12 +150,18 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   # ─── INDEXER ────────────────────────────────────────────────────────────────
   indexer:
     build:
       context: .
       dockerfile: Dockerfile.ml
+    restart: unless-stopped
     command: uvicorn indexer:fa_app --host 0.0.0.0 --port 8082
     ports:
       - "8082:8082"
@@ -95,6 +173,7 @@ services:
       - CHROMA_PATH=/data/chroma_db
       - REDIS_URL=redis://redis:6379
       - CUDA_VISIBLE_DEVICES=
+
     depends_on:
       redis:
         condition: service_healthy
@@ -104,12 +183,18 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   # ─── Q&A ────────────────────────────────────────────────────────────────────
   qa:
     build:
       context: .
       dockerfile: Dockerfile.ml
+    restart: unless-stopped
     command: uvicorn place_qa:app --host 0.0.0.0 --port 8083
     ports:
       - "8083:8083"
@@ -130,12 +215,18 @@ services:
       timeout: 5s
       retries: 5
       start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   # ─── ENRICHER ───────────────────────────────────────────────────────────────
   enricher:
     build:
       context: .
       dockerfile: Dockerfile.ml
+    restart: unless-stopped
     command: uvicorn instagram_scraper:app --host 0.0.0.0 --port 8084
     ports:
       - "8084:8084"
@@ -156,6 +247,40 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ─── DB WRITER ──────────────────────────────────────────────────────────────
+  db_writer:
+    build:
+      context: .
+      dockerfile: Dockerfile.ml
+    restart: unless-stopped
+    command: uvicorn db_writer:app --host 0.0.0.0 --port 8086
+    ports:
+      - "8086:8086"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-changeme}@db:5432/${POSTGRES_DB:-neredenevar}
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   hf_cache:   # sentence-transformers model cache
