@@ -1,0 +1,9 @@
+.env
+.idea/
+__pycache__/
+*.pyc
+*.log
+*.json
+!.env.example
+chroma_db/
+instagram_cookies.json

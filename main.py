@@ -179,6 +179,71 @@ def _collect_urls_from_feed(page: Page, seen_urls: set) -> list[str]:
 
 # ─── Faz 2: Mekanı scrape et ─────────────────────────────────────────────────
 
+def _detect_link_type(url: str) -> str:
+    if not url:
+        return "unknown"
+    if "instagram.com" in url:
+        return "instagram"
+    if "facebook.com" in url:
+        return "facebook"
+    if "tripadvisor.com" in url:
+        return "tripadvisor"
+    return "website"
+
+
+def _get_images(page: Page, max_images: int = 10) -> list[str]:
+    urls = []
+    try:
+        photos_btn = page.locator('button[aria-label*="Fotoğraf"], button[aria-label*="Photo"]').first
+        if photos_btn.count() > 0:
+            photos_btn.click()
+            page.wait_for_timeout(2000)
+
+        for el in page.locator('button[style*="background-image"]').all():
+            style = el.get_attribute("style") or ""
+            import re as _re
+            match = _re.search(r'url\("?(https?://[^")\s]+)"?\)', style)
+            if match:
+                img_url = match.group(1)
+                if img_url not in urls:
+                    urls.append(img_url)
+            if len(urls) >= max_images:
+                break
+
+        if not urls:
+            for img in page.locator('img[src*="googleusercontent"]').all():
+                src = img.get_attribute("src") or ""
+                if src and src not in urls:
+                    urls.append(src)
+                if len(urls) >= max_images:
+                    break
+    except Exception:
+        pass
+    return urls[:max_images]
+
+
+def _extract_external_links(page: Page) -> dict:
+    result = {"website_url": None, "website_type": None}
+    try:
+        # Google Maps website butonu: data-item-id="authority" veya aria-label içeriği
+        selectors = [
+            'a[data-item-id="authority"]',
+            'a[aria-label*="web" i]',
+            'a[aria-label*="site" i]',
+        ]
+        for sel in selectors:
+            el = page.locator(sel).first
+            if el.count() > 0:
+                href = el.get_attribute("href")
+                if href and href.startswith("http"):
+                    result["website_url"] = href
+                    result["website_type"] = _detect_link_type(href)
+                    break
+    except Exception:
+        pass
+    return result
+
+
 def _scrape_place(page: Page, url: str, max_reviews: int) -> dict:
     page.goto(url)
     page.wait_for_timeout(3000)
@@ -189,8 +254,18 @@ def _scrape_place(page: Page, url: str, max_reviews: int) -> dict:
     except Exception:
         pass
 
+    links = _extract_external_links(page)
     reviews = get_reviews_for_place(page, max_reviews=max_reviews)
-    return {"url": url, "name": place_name, "total_reviews_scraped": len(reviews), "reviews": reviews}
+    images = _get_images(page, max_images=10)
+    return {
+        "url": url,
+        "name": place_name,
+        "website_url": links["website_url"],
+        "website_type": links["website_type"],
+        "images": images,
+        "total_reviews_scraped": len(reviews),
+        "reviews": reviews,
+    }
 
 
 # ─── Grid tarama ─────────────────────────────────────────────────────────────

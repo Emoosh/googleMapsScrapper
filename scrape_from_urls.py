@@ -105,6 +105,39 @@ def get_reviews(page, max_reviews: int) -> list[str]:
         return []
 
 
+def detect_link_type(url: str) -> str:
+    if not url:
+        return "unknown"
+    if "instagram.com" in url:
+        return "instagram"
+    if "facebook.com" in url:
+        return "facebook"
+    if "tripadvisor.com" in url:
+        return "tripadvisor"
+    return "website"
+
+
+def extract_external_links(page) -> dict:
+    result = {"website_url": None, "website_type": None}
+    try:
+        selectors = [
+            'a[data-item-id="authority"]',
+            'a[aria-label*="web" i]',
+            'a[aria-label*="site" i]',
+        ]
+        for sel in selectors:
+            el = page.locator(sel).first
+            if el.count() > 0:
+                href = el.get_attribute("href")
+                if href and href.startswith("http"):
+                    result["website_url"] = href
+                    result["website_type"] = detect_link_type(href)
+                    break
+    except Exception:
+        pass
+    return result
+
+
 def get_images(page, max_images: int = 10) -> list[str]:
     try:
         photos_btn = page.locator('button[aria-label*="Fotoğraf"], button[aria-label*="Photo"]').first
@@ -174,9 +207,18 @@ def main():
 
                 reviews = get_reviews(page, MAX_REVIEWS)
                 images = get_images(page, max_images=10)
-                print(f"  {name} | {len(reviews)} yorum | {len(images)} resim")
+                links = extract_external_links(page)
+                print(f"  {name} | {len(reviews)} yorum | {len(images)} resim | site: {links['website_type']}")
 
-                results.append({"url": url, "name": name, "total_reviews_scraped": len(reviews), "reviews": reviews, "images": images})
+                results.append({
+                    "url": url,
+                    "name": name,
+                    "website_url": links["website_url"],
+                    "website_type": links["website_type"],
+                    "total_reviews_scraped": len(reviews),
+                    "reviews": reviews,
+                    "images": images,
+                })
                 save(results, OUTPUT_FILE)
             except Exception as e:
                 print(f"  Hata: {e}")

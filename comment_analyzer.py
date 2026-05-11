@@ -22,9 +22,14 @@ from pathlib import Path
 from datetime import datetime, UTC
 from urllib.parse import unquote
 
+import time
+
 import redis
+from anthropic import Anthropic, RateLimitError, APIStatusError
+from dotenv import load_dotenv
 from fastapi import FastAPI
-from openai import OpenAI
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -42,9 +47,8 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-LLM_BASE_URL  = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
-DEFAULT_MODEL = os.getenv("LLM_MODEL", "turkish-gemma")
-MAX_RETRIES     = 3
+DEFAULT_MODEL = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")
+MAX_RETRIES   = 3
 
 TARGET_SCHEMA = {
     "place_name": "string",
@@ -104,8 +108,7 @@ def clean_response(raw: str) -> str:
     return raw
 
 
-MAX_REVIEWS    = 25   # token limitine göre gönderilecek max yorum sayısı
-MAX_REVIEW_LEN = 200  # her yorumun max karakter uzunluğu
+MAX_REVIEWS    = 200
 
 
 def _max_score_for_review_count(n: int) -> float:
@@ -116,7 +119,7 @@ def _max_score_for_review_count(n: int) -> float:
 
 
 def build_user_message(place_name: str, reviews: list[str]) -> str:
-    truncated = [r[:MAX_REVIEW_LEN] for r in reviews[:MAX_REVIEWS]]
+    truncated = reviews[:MAX_REVIEWS]
     reviews_text = "\n".join(f"{i+1}. {r}" for i, r in enumerate(truncated))
     schema_str   = json.dumps(TARGET_SCHEMA, ensure_ascii=False, indent=2)
     max_score    = _max_score_for_review_count(len(truncated))
@@ -145,7 +148,7 @@ Kurallar:
 # ---------------------------------------------------------------------------
 
 def analyze_single(
-    client: OpenAI,
+    client: Anthropic,
     model: str,
     place_name: str,
     reviews: list[str],
@@ -168,29 +171,34 @@ def analyze_single(
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = client.chat.completions.create(
+            response = client.messages.create(
                 model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": build_user_message(place_name, reviews)},
-                ],
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": build_user_message(place_name, reviews)}],
                 temperature=0.1,
                 max_tokens=2048,
             )
-            raw = clean_response(response.choices[0].message.content or "")
+            raw = clean_response(response.content[0].text or "")
             log.debug(f"  RAW response: {repr(raw[:300])}")
             parsed = json.loads(raw)
             return parsed
 
         except json.JSONDecodeError as e:
             log.warning(f"  JSON parse hatası (deneme {attempt}/{MAX_RETRIES}): {e}")
+        except RateLimitError:
+            wait = 2 ** attempt
+            log.warning(f"  Rate limit aşıldı, {wait}s bekleniyor (deneme {attempt}/{MAX_RETRIES})...")
+            time.sleep(wait)
+            continue
+        except APIStatusError as e:
+            log.warning(f"  API hatası {e.status_code} (deneme {attempt}/{MAX_RETRIES}): {e.message}")
         except Exception as e:
             log.warning(f"  Hata (deneme {attempt}/{MAX_RETRIES}): {e}")
 
         if attempt == MAX_RETRIES:
             raise RuntimeError(f"'{place_name}' için {MAX_RETRIES} denemede de analiz başarısız.")
 
-        log.info(f"  Tekrar deneniyor...")
+        log.info("  Tekrar deneniyor...")
 
     raise RuntimeError(f"'{place_name}' analiz başarısız.")
 
@@ -217,8 +225,8 @@ def run(input_path: str, output_path: str, model: str, dry_run: bool = False):
 
     client = None
     if not dry_run:
-        client = OpenAI(base_url=LLM_BASE_URL, api_key="dummy")
-        log.info(f"vLLM bağlantısı: {LLM_BASE_URL} | Model: {model}")
+        client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        log.info(f"Anthropic bağlantısı kuruldu | Model: {model}")
 
     results = []
     failed  = []
@@ -345,7 +353,7 @@ def _append_to_output(result: dict, output_path: str):
 
 def _worker_loop(model: str, output_path: str):
     log.info(f"[worker] Redis worker başladı — kuyruk: {QUEUE_NAME}")
-    client = OpenAI(base_url=LLM_BASE_URL, api_key="dummy")
+    client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     r = redis.from_url(REDIS_URL, decode_responses=True)
 
     while _worker_stats["running"]:
@@ -434,7 +442,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kafe yorum analiz mikroservisi")
     parser.add_argument("--input",   default=ANALYZER_INPUT)
     parser.add_argument("--output",  default=ANALYZER_OUTPUT)
-    parser.add_argument("--model",   default=DEFAULT_MODEL, help="vLLM model adı (served-model-name)")
+    parser.add_argument("--model",   default=DEFAULT_MODEL, help="Anthropic model adı")
     parser.add_argument("--dry-run", action="store_true", help="API çağrısı yapmadan test et")
     args = parser.parse_args()
 

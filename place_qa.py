@@ -24,7 +24,7 @@ from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from openai import OpenAI
+from anthropic import Anthropic
 import chromadb
 
 # ---------------------------------------------------------------------------
@@ -41,8 +41,7 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 load_dotenv()
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
-LLM_MODEL    = os.getenv("LLM_MODEL", "turkish-gemma")
+LLM_MODEL = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")
 EMBED_MODEL   = "intfloat/multilingual-e5-large"
 CHROMA_PATH   = os.getenv("CHROMA_PATH", "./chroma_db")
 COLLECTION_NAME = "place_reviews"
@@ -69,7 +68,7 @@ else:
 # ---------------------------------------------------------------------------
 log.info(f"Embedding modeli yükleniyor: {EMBED_MODEL} ({DEVICE})")
 embed_model = SentenceTransformer(EMBED_MODEL, device=DEVICE)
-llm_client = OpenAI(base_url=LLM_BASE_URL, api_key="dummy")
+llm_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 def get_collection():
     client = chromadb.PersistentClient(path=CHROMA_PATH)
@@ -152,17 +151,15 @@ def ask(req: AskRequest):
             detail=f"'{req.place_name}' için indexli yorum bulunamadı. Önce indexer.py çalıştırın.",
         )
 
-    # 3. Local LLM ile cevap üret
-    response = llm_client.chat.completions.create(
+    # 3. Claude Haiku ile cevap üret
+    response = llm_client.messages.create(
         model=LLM_MODEL,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": build_user_message(req.place_name, req.question, reviews)}],
         max_tokens=512,
         temperature=0.1,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_message(req.place_name, req.question, reviews)},
-        ],
     )
-    raw = response.choices[0].message.content or ""
+    raw = response.content[0].text or ""
     if "</think>" in raw:
         answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     else:

@@ -29,41 +29,6 @@ services:
       timeout: 3s
       retries: 5
 
-  # ─── LLM ────────────────────────────────────────────────────────────────────
-  llm:
-    image: vllm/vllm-openai:latest
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
-    volumes:
-      - hf_cache:/root/.cache/huggingface
-    ports:
-      - "8000:8000"
-    command: >
-      --model ytu-ce-cosmos/Turkish-Gemma-9b-T1
-      --served-model-name turkish-gemma
-      --dtype bfloat16
-      --quantization bitsandbytes
-      --load-format bitsandbytes
-      --max-model-len 4096
-      --gpu-memory-utilization 0.85
-      --max-num-seqs 64
-    ipc: host
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 10
-      start_period: 120s
-
   # ─── SCRAPER ────────────────────────────────────────────────────────────────
   scraper:
     build:
@@ -98,15 +63,13 @@ services:
     volumes:
       - data:/data
     environment:
-      - LLM_BASE_URL=http://llm:8000/v1
-      - LLM_MODEL=turkish-gemma
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-claude-haiku-4-5-20251001}
       - ANALYZER_INPUT=/data/scraped_data.json
       - ANALYZER_OUTPUT=/data/analyzed_data.json
       - REDIS_URL=redis://redis:6379
       - CUDA_VISIBLE_DEVICES=
     depends_on:
-      llm:
-        condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
@@ -154,14 +117,12 @@ services:
       - data:/data
       - hf_cache:/root/.cache/huggingface
     environment:
-      - LLM_BASE_URL=http://llm:8000/v1
-      - LLM_MODEL=turkish-gemma
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-claude-haiku-4-5-20251001}
       - CHROMA_PATH=/data/chroma_db
       - CUDA_VISIBLE_DEVICES=
     depends_on:
       indexer:
-        condition: service_healthy
-      llm:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8083/health"]
@@ -170,7 +131,33 @@ services:
       retries: 5
       start_period: 60s
 
+  # ─── ENRICHER ───────────────────────────────────────────────────────────────
+  enricher:
+    build:
+      context: .
+      dockerfile: Dockerfile.ml
+    command: uvicorn instagram_scraper:app --host 0.0.0.0 --port 8084
+    ports:
+      - "8084:8084"
+    volumes:
+      - data:/data
+    environment:
+      - ENRICHER_INPUT=/data/scraped_data.json
+      - ENRICHER_OUTPUT=/data/enriched_data.json
+      - REDIS_URL=redis://redis:6379
+      - INSTAGRAM_MAX_POSTS=10
+      - INSTAGRAM_SLEEP=4.0
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8084/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
 volumes:
-  hf_cache:   # vLLM + sentence-transformers model cache
+  hf_cache:   # sentence-transformers model cache
   data:       # scraped_data.json, analyzed_data.json, chroma_db/ (shared between services)
   pg_data:    # postgres persistent storage

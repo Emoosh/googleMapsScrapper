@@ -1,7 +1,6 @@
 anthropic
 chromadb
 fastapi
-openai
 playwright
 pydantic
 python-dotenv
