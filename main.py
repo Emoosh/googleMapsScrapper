@@ -442,7 +442,8 @@ def _get_reviews(page: Page, max_reviews: int = 200) -> list:
 
             if len(collected) == last_count:
                 scroll_attempts += 1
-                if scroll_attempts > 8:
+                limit = 2 if len(collected) == 0 else 8
+                if scroll_attempts > limit:
                     log.info("Daha fazla yeni yorum bulunamadı, durduruluyor.")
                     break
             else:
