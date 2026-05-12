@@ -51,8 +51,8 @@ def _migrate():
     conn = get_conn()
     try:
         with conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
             cur.execute("""
-                CREATE EXTENSION IF NOT EXISTS postgis;
                 CREATE TABLE IF NOT EXISTS places (
                     id            SERIAL PRIMARY KEY,
                     name          TEXT,
@@ -82,7 +82,8 @@ def _migrate():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS place_analysis (
                     id                      SERIAL PRIMARY KEY,
-                    place_id                INT REFERENCES places(id) ON DELETE CASCADE,
+                    place_id                INT UNIQUE REFERENCES places(id) ON DELETE CASCADE,
+                    analyzed_at             TIMESTAMPTZ DEFAULT NOW(),
                     overall_score           FLOAT,
                     summary                 TEXT,
                     ideal_for               TEXT,
@@ -99,7 +100,6 @@ def _migrate():
                     kalabalik_seviyesi      TEXT
                 )
             """)
-            cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
             cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS location GEOMETRY(Point, 4326)")
             cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS address TEXT")
             cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS phone TEXT")
@@ -108,6 +108,7 @@ def _migrate():
             cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS website_url TEXT")
             cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS website_type TEXT")
             cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS images TEXT[]")
+            cur.execute("ALTER TABLE place_analysis ADD COLUMN IF NOT EXISTS analyzed_at TIMESTAMPTZ DEFAULT NOW()")
             cur.execute("ALTER TABLE place_analysis ADD COLUMN IF NOT EXISTS wifi_priz TEXT")
             cur.execute("ALTER TABLE place_analysis ADD COLUMN IF NOT EXISTS kalabalik_seviyesi TEXT")
         conn.commit()
