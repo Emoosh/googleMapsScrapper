@@ -51,6 +51,52 @@ def _migrate():
     conn = get_conn()
     try:
         with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS places (
+                    id            SERIAL PRIMARY KEY,
+                    name          TEXT,
+                    source_url    TEXT UNIQUE,
+                    place_type    TEXT,
+                    lat           FLOAT,
+                    lng           FLOAT,
+                    total_reviews INT,
+                    address       TEXT,
+                    phone         TEXT,
+                    rating        FLOAT,
+                    total_ratings INT,
+                    website_url   TEXT,
+                    website_type  TEXT,
+                    images        TEXT[],
+                    scraped_at    TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS reviews (
+                    id       SERIAL PRIMARY KEY,
+                    place_id INT REFERENCES places(id) ON DELETE CASCADE,
+                    content  TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS place_analysis (
+                    id                      SERIAL PRIMARY KEY,
+                    place_id                INT REFERENCES places(id) ON DELETE CASCADE,
+                    overall_score           FLOAT,
+                    summary                 TEXT,
+                    ideal_for               TEXT,
+                    price_level             TEXT,
+                    score_service           FLOAT,
+                    score_price_performance FLOAT,
+                    score_atmosphere        FLOAT,
+                    scores_extra            JSONB,
+                    highlights              TEXT[],
+                    downsides               TEXT[],
+                    popular_items           TEXT[],
+                    tags                    TEXT[],
+                    wifi_priz               TEXT,
+                    kalabalik_seviyesi      TEXT
+                )
+            """)
             cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS address TEXT")
             cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS phone TEXT")
             cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS rating FLOAT")
