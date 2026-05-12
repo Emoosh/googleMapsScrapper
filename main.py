@@ -179,10 +179,35 @@ def _accept_consent(page: Page):
             continue
 
 
-def _goto(page: Page, url: str):
-    page.goto(url)
-    page.wait_for_timeout(3000)
-    _accept_consent(page)
+def _renew_tor_circuit():
+    tor_host = os.getenv("TOR_HOST", "localhost")
+    try:
+        with urllib.request.urlopen(f"http://{tor_host}:8118", timeout=3):
+            pass
+    except Exception:
+        pass
+    try:
+        import socket
+        s = socket.create_connection((tor_host, 9051), timeout=5)
+        s.sendall(b"AUTHENTICATE\r\nSIGNAL NEWNYM\r\n")
+        s.close()
+        log.info("[tor] Yeni devre istendi.")
+        time.sleep(5)
+    except Exception as e:
+        log.warning(f"[tor] Devre yenilenemedi: {e}")
+
+
+def _goto(page: Page, url: str, retries: int = 3):
+    for attempt in range(1, retries + 1):
+        page.goto(url)
+        page.wait_for_timeout(3000)
+        if "/sorry/" in page.url:
+            log.warning(f"[captcha] Google bot sayfası — yeni Tor devresi isteniyor (deneme {attempt}/{retries})")
+            _renew_tor_circuit()
+            continue
+        _accept_consent(page)
+        return
+    log.error(f"[captcha] {retries} denemede de bot sayfası aşılamadı: {url}")
 
 
 # ---------------------------------------------------------------------------
