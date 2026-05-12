@@ -29,6 +29,8 @@ log = logging.getLogger(__name__)
 LLM_MODEL       = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")
 EMBED_MODEL     = "intfloat/multilingual-e5-large"
 CHROMA_PATH     = os.getenv("CHROMA_PATH", "./chroma_db")
+CHROMA_HOST     = os.getenv("CHROMA_HOST", "")
+CHROMA_PORT     = int(os.getenv("CHROMA_PORT", "8000"))
 COLLECTION_NAME = "place_reviews"
 DEFAULT_TOP_K   = 6
 
@@ -62,7 +64,7 @@ async def lifespan(app: FastAPI):
     log.info(f"Embedding modeli yükleniyor: {EMBED_MODEL} ({DEVICE})")
     embed_model  = SentenceTransformer(EMBED_MODEL, device=DEVICE)
     llm_client   = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+    chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT) if CHROMA_HOST else chromadb.PersistentClient(path=CHROMA_PATH)
     collection   = chroma_client.get_or_create_collection(
         name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},

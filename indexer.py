@@ -29,6 +29,8 @@ log = logging.getLogger(__name__)
 
 EMBED_MODEL     = "intfloat/multilingual-e5-large"
 CHROMA_PATH     = os.getenv("CHROMA_PATH", "./chroma_db")
+CHROMA_HOST     = os.getenv("CHROMA_HOST", "")
+CHROMA_PORT     = int(os.getenv("CHROMA_PORT", "8000"))
 COLLECTION_NAME = "place_reviews"
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379")
 INDEXER_INPUT   = os.getenv("INDEXER_INPUT", "scraped_data.json")
@@ -122,7 +124,7 @@ def run(input_path: str, reset: bool = False):
     with open(input_file, encoding="utf-8") as f:
         scraped_data = json.load(f)
 
-    chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+    chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT) if CHROMA_HOST else chromadb.PersistentClient(path=CHROMA_PATH)
     if reset:
         log.warning("--reset: koleksiyon siliniyor ve yeniden oluşturuluyor.")
         try:
@@ -176,7 +178,7 @@ def _worker_loop():
     log.info(f"[worker] Indexer Redis worker başladı — kuyruk: {QUEUE_NAME}")
     model         = SentenceTransformer(EMBED_MODEL, device=DEVICE)
     r             = redis.from_url(REDIS_URL, decode_responses=True)
-    chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+    chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT) if CHROMA_HOST else chromadb.PersistentClient(path=CHROMA_PATH)
     collection    = chroma_client.get_or_create_collection(
         name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
