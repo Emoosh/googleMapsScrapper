@@ -52,11 +52,13 @@ def _migrate():
     try:
         with conn.cursor() as cur:
             cur.execute("""
+                CREATE EXTENSION IF NOT EXISTS postgis;
                 CREATE TABLE IF NOT EXISTS places (
                     id            SERIAL PRIMARY KEY,
                     name          TEXT,
                     source_url    TEXT UNIQUE,
                     place_type    TEXT,
+                    location      GEOMETRY(Point, 4326),
                     lat           FLOAT,
                     lng           FLOAT,
                     total_reviews INT,
