@@ -99,6 +99,8 @@ def _migrate():
                     kalabalik_seviyesi      TEXT
                 )
             """)
+            cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
+            cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS location GEOMETRY(Point, 4326)")
             cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS address TEXT")
             cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS phone TEXT")
             cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS rating FLOAT")
