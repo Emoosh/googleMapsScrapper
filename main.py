@@ -359,6 +359,8 @@ def _extract_place_details(page: Page) -> dict:
 def _scrape_place(page: Page, url: str, max_reviews: Optional[int]) -> dict:
     _goto(page, url)
 
+    log.info(f"[page] URL: {page.url} | Title: {page.title()}")
+
     place_name = ""
     try:
         place_name = page.locator('h1').first.inner_text(timeout=3000)
