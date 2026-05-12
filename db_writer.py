@@ -111,6 +111,18 @@ def _migrate():
             cur.execute("ALTER TABLE place_analysis ADD COLUMN IF NOT EXISTS analyzed_at TIMESTAMPTZ DEFAULT NOW()")
             cur.execute("ALTER TABLE place_analysis ADD COLUMN IF NOT EXISTS wifi_priz TEXT")
             cur.execute("ALTER TABLE place_analysis ADD COLUMN IF NOT EXISTS kalabalik_seviyesi TEXT")
+            cur.execute("""
+                DO $$ BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conrelid = 'place_analysis'::regclass
+                        AND contype = 'u'
+                        AND conname = 'place_analysis_place_id_key'
+                    ) THEN
+                        ALTER TABLE place_analysis ADD CONSTRAINT place_analysis_place_id_key UNIQUE (place_id);
+                    END IF;
+                END $$
+            """)
         conn.commit()
         log.info("[migrate] Tablolar güncellendi.")
     finally:
