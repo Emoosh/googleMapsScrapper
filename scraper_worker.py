@@ -62,6 +62,13 @@ def _worker_loop():
             try:
                 place_data = _scrape_place(page, url, max_reviews)
 
+                lat, lng = place_data.get("lat"), place_data.get("lng")
+                if lat and lng and not (39.75 <= lat <= 40.05 and 32.50 <= lng <= 33.10):
+                    log.info(f"[{WORKER_ID}] Ankara dışı, atlandı: {place_data['name']} ({lat}, {lng})")
+                    r.sadd(SCRAPED_URLS_KEY, url)
+                    _stats["processed"] += 1
+                    continue
+
                 log.info(
                     f"[{WORKER_ID}] ✓ {place_data['name']} | "
                     f"{place_data['total_reviews_scraped']} yorum"
