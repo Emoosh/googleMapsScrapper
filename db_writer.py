@@ -50,7 +50,6 @@ def _migrate():
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS place_urls (
                     id            SERIAL PRIMARY KEY,
