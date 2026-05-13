@@ -20,11 +20,10 @@ log = logging.getLogger(__name__)
 
 REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://app:changeme@db:5432/neredenevar")
-DB_QUEUE     = "queue:places:to_db"
 
-# ---------------------------------------------------------------------------
-# Connection pool (min=1, max=5 — worker is single-threaded, pool for health checks)
-# ---------------------------------------------------------------------------
+URLS_QUEUE     = "queue:urls:db"
+RAW_QUEUE      = "queue:places:raw_db"
+ANALYSIS_QUEUE = "queue:places:to_db"
 
 _pool: psycopg2.pool.ThreadedConnectionPool = None
 
@@ -52,6 +51,16 @@ def _migrate():
     try:
         with conn.cursor() as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS place_urls (
+                    id            SERIAL PRIMARY KEY,
+                    url           TEXT UNIQUE,
+                    status        TEXT DEFAULT 'pending',
+                    discovered_at TIMESTAMPTZ DEFAULT NOW(),
+                    scraped_at    TIMESTAMPTZ,
+                    analyzed_at   TIMESTAMPTZ
+                )
+            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS places (
                     id            SERIAL PRIMARY KEY,
@@ -100,17 +109,23 @@ def _migrate():
                     kalabalik_seviyesi      TEXT
                 )
             """)
-            cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS location GEOMETRY(Point, 4326)")
-            cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS address TEXT")
-            cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS phone TEXT")
-            cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS rating FLOAT")
-            cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS total_ratings INT")
-            cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS website_url TEXT")
-            cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS website_type TEXT")
-            cur.execute("ALTER TABLE places ADD COLUMN IF NOT EXISTS images TEXT[]")
-            cur.execute("ALTER TABLE place_analysis ADD COLUMN IF NOT EXISTS analyzed_at TIMESTAMPTZ DEFAULT NOW()")
-            cur.execute("ALTER TABLE place_analysis ADD COLUMN IF NOT EXISTS wifi_priz TEXT")
-            cur.execute("ALTER TABLE place_analysis ADD COLUMN IF NOT EXISTS kalabalik_seviyesi TEXT")
+            # Backward-compat column additions
+            for col in [
+                "ALTER TABLE places ADD COLUMN IF NOT EXISTS location GEOMETRY(Point, 4326)",
+                "ALTER TABLE places ADD COLUMN IF NOT EXISTS lat FLOAT",
+                "ALTER TABLE places ADD COLUMN IF NOT EXISTS lng FLOAT",
+                "ALTER TABLE places ADD COLUMN IF NOT EXISTS address TEXT",
+                "ALTER TABLE places ADD COLUMN IF NOT EXISTS phone TEXT",
+                "ALTER TABLE places ADD COLUMN IF NOT EXISTS rating FLOAT",
+                "ALTER TABLE places ADD COLUMN IF NOT EXISTS total_ratings INT",
+                "ALTER TABLE places ADD COLUMN IF NOT EXISTS website_url TEXT",
+                "ALTER TABLE places ADD COLUMN IF NOT EXISTS website_type TEXT",
+                "ALTER TABLE places ADD COLUMN IF NOT EXISTS images TEXT[]",
+                "ALTER TABLE place_analysis ADD COLUMN IF NOT EXISTS analyzed_at TIMESTAMPTZ DEFAULT NOW()",
+                "ALTER TABLE place_analysis ADD COLUMN IF NOT EXISTS wifi_priz TEXT",
+                "ALTER TABLE place_analysis ADD COLUMN IF NOT EXISTS kalabalik_seviyesi TEXT",
+            ]:
+                cur.execute(col)
             cur.execute("""
                 DO $$ BEGIN
                     IF NOT EXISTS (
@@ -130,92 +145,84 @@ def _migrate():
 
 
 # ---------------------------------------------------------------------------
-# Write
+# Write: Phase 1 — URL kaydı
 # ---------------------------------------------------------------------------
 
-def write_to_db(payload: dict):
-    place    = payload["place"]
-    analysis = payload.get("analysis", {})
-
-    lat = place.get("lat")
-    lng = place.get("lng")
-    url = place.get("url", "")
-
+def write_url(payload: dict):
+    url = payload.get("url", "")
+    if not url:
+        return
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            if lat is not None and lng is not None:
-                cur.execute("""
-                    INSERT INTO places
-                        (name, source_url, place_type, location, total_reviews,
-                         address, phone, rating, total_ratings,
-                         website_url, website_type, images, scraped_at)
-                    VALUES
-                        (%s, %s, 'cafe', ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s,
-                         %s, %s, %s, %s,
-                         %s, %s, %s, NOW())
-                    ON CONFLICT (source_url) DO UPDATE SET
-                        name          = EXCLUDED.name,
-                        location      = EXCLUDED.location,
-                        total_reviews = EXCLUDED.total_reviews,
-                        address       = EXCLUDED.address,
-                        phone         = EXCLUDED.phone,
-                        rating        = EXCLUDED.rating,
-                        total_ratings = EXCLUDED.total_ratings,
-                        website_url   = EXCLUDED.website_url,
-                        website_type  = EXCLUDED.website_type,
-                        images        = EXCLUDED.images,
-                        scraped_at    = NOW()
-                    RETURNING id
-                """, (
-                    place.get("name"), url,
-                    lng, lat,
-                    place.get("total_ratings") or len(place.get("reviews", [])),
-                    place.get("address"), place.get("phone"),
-                    place.get("rating"), place.get("total_ratings"),
-                    place.get("website_url"), place.get("website_type"),
-                    place.get("images") or [],
-                ))
-            else:
-                cur.execute("""
-                    INSERT INTO places
-                        (name, source_url, place_type, location, total_reviews,
-                         address, phone, rating, total_ratings,
-                         website_url, website_type, images, scraped_at)
-                    VALUES
-                        (%s, %s, 'cafe', ST_SetSRID(ST_MakePoint(0,0), 4326), %s,
-                         %s, %s, %s, %s,
-                         %s, %s, %s, NOW())
-                    ON CONFLICT (source_url) DO UPDATE SET
-                        name          = EXCLUDED.name,
-                        total_reviews = EXCLUDED.total_reviews,
-                        address       = EXCLUDED.address,
-                        phone         = EXCLUDED.phone,
-                        rating        = EXCLUDED.rating,
-                        total_ratings = EXCLUDED.total_ratings,
-                        website_url   = EXCLUDED.website_url,
-                        website_type  = EXCLUDED.website_type,
-                        images        = EXCLUDED.images,
-                        scraped_at    = NOW()
-                    RETURNING id
-                """, (
-                    place.get("name"), url,
-                    place.get("total_ratings") or len(place.get("reviews", [])),
-                    place.get("address"), place.get("phone"),
-                    place.get("rating"), place.get("total_ratings"),
-                    place.get("website_url"), place.get("website_type"),
-                    place.get("images") or [],
-                ))
+            cur.execute("""
+                INSERT INTO place_urls (url, status, discovered_at)
+                VALUES (%s, 'pending', NOW())
+                ON CONFLICT (url) DO NOTHING
+            """, (url,))
+        conn.commit()
+        log.info(f"  ✓ URL kaydedildi: {url[:60]}")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
+
+
+# ---------------------------------------------------------------------------
+# Write: Phase 2 — Ham scrape verisi (images dahil)
+# ---------------------------------------------------------------------------
+
+def write_raw_place(payload: dict):
+    url  = payload.get("url", "")
+    lat  = payload.get("lat")
+    lng  = payload.get("lng")
+    # lat/lng are GENERATED ALWAYS columns (computed from location) — cannot be inserted directly
+    point_lng = float(lng) if lng is not None else 0.0
+    point_lat = float(lat) if lat is not None else 0.0
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO places
+                    (name, source_url, place_type, location, total_reviews,
+                     address, phone, rating, total_ratings, website_url, website_type,
+                     images, scraped_at)
+                VALUES
+                    (%s, %s, 'cafe', ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s,
+                     %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (source_url) DO UPDATE SET
+                    name          = EXCLUDED.name,
+                    location      = EXCLUDED.location,
+                    total_reviews = EXCLUDED.total_reviews,
+                    address       = EXCLUDED.address,
+                    phone         = EXCLUDED.phone,
+                    rating        = EXCLUDED.rating,
+                    total_ratings = EXCLUDED.total_ratings,
+                    website_url   = EXCLUDED.website_url,
+                    website_type  = EXCLUDED.website_type,
+                    images        = EXCLUDED.images,
+                    scraped_at    = NOW()
+                RETURNING id
+            """, (
+                payload.get("name") or "Bilinmeyen", url,
+                point_lng, point_lat,
+                payload.get("total_reviews_scraped") or len(payload.get("reviews", [])),
+                payload.get("address"), payload.get("phone"),
+                payload.get("rating"), payload.get("total_ratings"),
+                payload.get("website_url"), payload.get("website_type"),
+                payload.get("images") or [],
+            ))
 
             row = cur.fetchone()
             if not row:
                 conn.rollback()
-                log.warning(f"place upsert dönmedi: {url}")
+                log.warning(f"place upsert sonuç döndürmedi: {url}")
                 return
             place_id = row[0]
 
             cur.execute("DELETE FROM reviews WHERE place_id = %s", (place_id,))
-            reviews = place.get("reviews", [])
+            reviews = payload.get("reviews", [])
             if reviews:
                 psycopg2.extras.execute_values(
                     cur,
@@ -223,53 +230,90 @@ def write_to_db(payload: dict):
                     [(place_id, r) for r in reviews],
                 )
 
-            if analysis:
-                scores      = analysis.get("scores", {})
-                base_keys   = {"hizmet", "fiyat_performans", "atmosfer"}
-                scores_extra = {k: v for k, v in scores.items() if k not in base_keys}
-                cur.execute("""
-                    INSERT INTO place_analysis (
-                        place_id, analyzed_at, overall_score, summary, ideal_for, price_level,
-                        score_service, score_price_performance, score_atmosphere,
-                        scores_extra, highlights, downsides, popular_items, tags,
-                        wifi_priz, kalabalik_seviyesi
-                    ) VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (place_id) DO UPDATE SET
-                        analyzed_at             = NOW(),
-                        overall_score           = EXCLUDED.overall_score,
-                        summary                 = EXCLUDED.summary,
-                        ideal_for               = EXCLUDED.ideal_for,
-                        price_level             = EXCLUDED.price_level,
-                        score_service           = EXCLUDED.score_service,
-                        score_price_performance = EXCLUDED.score_price_performance,
-                        score_atmosphere        = EXCLUDED.score_atmosphere,
-                        scores_extra            = EXCLUDED.scores_extra,
-                        highlights              = EXCLUDED.highlights,
-                        downsides               = EXCLUDED.downsides,
-                        popular_items           = EXCLUDED.popular_items,
-                        tags                    = EXCLUDED.tags,
-                        wifi_priz               = EXCLUDED.wifi_priz,
-                        kalabalik_seviyesi      = EXCLUDED.kalabalik_seviyesi
-                """, (
-                    place_id,
-                    analysis.get("genel_puan"),
-                    analysis.get("ozet"),
-                    analysis.get("kim_icin_ideal"),
-                    analysis.get("fiyat_seviyesi"),
-                    scores.get("hizmet"),
-                    scores.get("fiyat_performans"),
-                    scores.get("atmosfer"),
-                    json.dumps(scores_extra, ensure_ascii=False),
-                    analysis.get("one_cikanlar") or [],
-                    analysis.get("eksiler") or [],
-                    analysis.get("populer_urunler") or [],
-                    analysis.get("etiketler") or [],
-                    analysis.get("wifi_priz", "belirtilmemiş"),
-                    analysis.get("kalabalik_seviyesi", "belirtilmemiş"),
-                ))
+            cur.execute("""
+                UPDATE place_urls SET status='scraped', scraped_at=NOW() WHERE url=%s
+            """, (url,))
 
         conn.commit()
-        log.info(f"  ✓ DB yazıldı: '{place.get('name')}' (id={place_id})")
+        log.info(f"  ✓ Ham veri yazıldı: '{payload.get('name')}' (id={place_id}, {len(reviews)} yorum)")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_conn(conn)
+
+
+# ---------------------------------------------------------------------------
+# Write: Phase 3 — Analiz sonucu
+# ---------------------------------------------------------------------------
+
+def write_analysis(payload: dict):
+    url      = payload.get("url", "")
+    analysis = payload.get("analysis", {})
+    if not analysis:
+        return
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM places WHERE source_url = %s", (url,))
+            row = cur.fetchone()
+            if not row:
+                log.warning(f"  ✗ place_analysis yazılamadı, places'da yok: {url[:60]}")
+                return
+            place_id = row[0]
+
+            scores       = analysis.get("scores", {})
+            base_keys    = {"hizmet", "fiyat_performans", "atmosfer"}
+            scores_extra = {k: v for k, v in scores.items() if k not in base_keys}
+
+            cur.execute("""
+                INSERT INTO place_analysis (
+                    place_id, analyzed_at, overall_score, summary, ideal_for, price_level,
+                    score_service, score_price_performance, score_atmosphere,
+                    scores_extra, highlights, downsides, popular_items, tags,
+                    wifi_priz, kalabalik_seviyesi
+                ) VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (place_id) DO UPDATE SET
+                    analyzed_at             = NOW(),
+                    overall_score           = EXCLUDED.overall_score,
+                    summary                 = EXCLUDED.summary,
+                    ideal_for               = EXCLUDED.ideal_for,
+                    price_level             = EXCLUDED.price_level,
+                    score_service           = EXCLUDED.score_service,
+                    score_price_performance = EXCLUDED.score_price_performance,
+                    score_atmosphere        = EXCLUDED.score_atmosphere,
+                    scores_extra            = EXCLUDED.scores_extra,
+                    highlights              = EXCLUDED.highlights,
+                    downsides               = EXCLUDED.downsides,
+                    popular_items           = EXCLUDED.popular_items,
+                    tags                    = EXCLUDED.tags,
+                    wifi_priz               = EXCLUDED.wifi_priz,
+                    kalabalik_seviyesi      = EXCLUDED.kalabalik_seviyesi
+            """, (
+                place_id,
+                analysis.get("genel_puan"),
+                analysis.get("ozet"),
+                analysis.get("kim_icin_ideal"),
+                analysis.get("fiyat_seviyesi"),
+                scores.get("hizmet"),
+                scores.get("fiyat_performans"),
+                scores.get("atmosfer"),
+                json.dumps(scores_extra, ensure_ascii=False),
+                analysis.get("one_cikanlar") or [],
+                analysis.get("eksiler") or [],
+                analysis.get("populer_urunler") or [],
+                analysis.get("etiketler") or [],
+                analysis.get("wifi_priz", "belirtilmemiş"),
+                analysis.get("kalabalik_seviyesi", "belirtilmemiş"),
+            ))
+
+            cur.execute("""
+                UPDATE place_urls SET status='analyzed', analyzed_at=NOW() WHERE url=%s
+            """, (url,))
+
+        conn.commit()
+        log.info(f"  ✓ Analiz yazıldı: place_id={place_id}")
     except Exception:
         conn.rollback()
         raise
@@ -283,30 +327,37 @@ def write_to_db(payload: dict):
 
 _worker_stats: dict = {"processed": 0, "failed": 0, "running": False}
 
+_QUEUES = [URLS_QUEUE, RAW_QUEUE, ANALYSIS_QUEUE]
+
+_HANDLERS = {
+    URLS_QUEUE:     write_url,
+    RAW_QUEUE:      write_raw_place,
+    ANALYSIS_QUEUE: write_analysis,
+}
+
 
 def _worker_loop():
-    log.info(f"[worker] DB Writer başladı — kuyruk: {DB_QUEUE}")
+    log.info(f"[worker] DB Writer başladı — kuyruklar: {_QUEUES}")
     r = redis.from_url(REDIS_URL, decode_responses=True)
 
     while _worker_stats["running"]:
-        item = r.brpop(DB_QUEUE, timeout=5)
+        item = r.brpop(_QUEUES, timeout=5)
         if item is None:
             continue
 
-        _, raw = item
+        queue_name, raw = item
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
-            log.error("[worker] Geçersiz JSON, atlanıyor.")
+            log.error(f"[worker] Geçersiz JSON ({queue_name}), atlanıyor.")
             continue
 
-        place_name = payload.get("place", {}).get("name", "?")
-        log.info(f"[worker] Yazılıyor: '{place_name}'")
+        log.info(f"[worker] {queue_name} → işleniyor")
         try:
-            write_to_db(payload)
+            _HANDLERS[queue_name](payload)
             _worker_stats["processed"] += 1
         except Exception as e:
-            log.error(f"[worker] Hata '{place_name}': {e}")
+            log.error(f"[worker] Hata ({queue_name}): {e}")
             _worker_stats["failed"] += 1
 
     log.info("[worker] DB Writer durduruldu.")
@@ -335,13 +386,14 @@ def health():
 
 @app.get("/worker/status")
 def worker_status():
-    pending = 0
+    pending = {}
     try:
-        r       = redis.from_url(REDIS_URL, decode_responses=True)
-        pending = r.llen(DB_QUEUE)
+        r = redis.from_url(REDIS_URL, decode_responses=True)
+        for q in _QUEUES:
+            pending[q] = r.llen(q)
     except Exception:
         pass
-    return {**_worker_stats, "queue_pending": pending}
+    return {**_worker_stats, "queues": pending}
 
 
 @app.post("/worker/stop")

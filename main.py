@@ -27,6 +27,7 @@ REDIS_URL         = os.getenv("REDIS_URL", "redis://localhost:6379")
 SCRAPER_OUTPUT    = os.getenv("SCRAPER_OUTPUT", "scraped_data.json")
 ANALYZER_QUEUE    = "queue:places:analyzer"
 INDEXER_QUEUE     = "queue:places:indexer"
+URLS_DB_QUEUE     = "queue:urls:db"
 SCRAPED_URLS_KEY  = "scraped:urls"
 SCRAPED_CELLS_KEY = "scraped:cells"
 PENDING_URLS_KEY  = "pending:urls"
@@ -592,6 +593,7 @@ def _scrape_city_grid(
                     for u in new_urls
                 ]
                 r.rpush(PENDING_URLS_KEY, *items)
+                r.rpush(URLS_DB_QUEUE, *[json.dumps({"url": u}) for u in new_urls])
                 already_seen.update(new_urls)
                 log.info(
                     f"[Faz 1] +{len(new_urls)} URL | "

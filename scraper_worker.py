@@ -17,10 +17,11 @@ from main import (
     _scrape_place,
     get_redis,
     ANALYZER_QUEUE,
-    INDEXER_QUEUE,
     SCRAPED_URLS_KEY,
     PENDING_URLS_KEY,
 )
+
+RAW_DB_QUEUE = "queue:places:raw_db"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,9 +67,13 @@ def _worker_loop():
                     f"{place_data['total_reviews_scraped']} yorum"
                 )
 
-                payload = json.dumps(place_data, ensure_ascii=False)
-                r.lpush(ANALYZER_QUEUE, payload)
-                r.lpush(INDEXER_QUEUE, payload)
+                # Ham veriyi (images dahil) DB'ye gönder
+                r.lpush(RAW_DB_QUEUE, json.dumps(place_data, ensure_ascii=False))
+
+                # Analyzer'a images olmadan gönder (images zaten DB'de)
+                analyzer_data = {k: v for k, v in place_data.items() if k != "images"}
+                r.lpush(ANALYZER_QUEUE, json.dumps(analyzer_data, ensure_ascii=False))
+
                 r.sadd(SCRAPED_URLS_KEY, url)
                 _stats["processed"] += 1
 

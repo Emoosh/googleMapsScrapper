@@ -310,20 +310,7 @@ def _worker_loop(model: str, output_path: str):
             log.info(f"[worker] ✓ '{place_name}' — genel puan: {result.get('genel_puan', '?')}")
 
             db_payload = json.dumps({
-                "place": {
-                    "url":           entry.get("url", ""),
-                    "name":          place_name,
-                    "lat":           entry.get("lat"),
-                    "lng":           entry.get("lng"),
-                    "address":       entry.get("address"),
-                    "phone":         entry.get("phone"),
-                    "rating":        entry.get("rating"),
-                    "total_ratings": entry.get("total_ratings"),
-                    "website_url":   entry.get("website_url"),
-                    "website_type":  entry.get("website_type"),
-                    "images":        entry.get("images", []),
-                    "reviews":       entry.get("reviews", []),
-                },
+                "url":      entry.get("url", ""),
                 "analysis": result,
             }, ensure_ascii=False)
             r.lpush(DB_QUEUE, db_payload)
