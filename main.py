@@ -113,6 +113,31 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/admin/sync-urls-to-db")
+def sync_urls_to_db():
+    r = get_redis()
+    pushed = 0
+
+    for raw in r.lrange(PENDING_URLS_KEY, 0, -1):
+        try:
+            url = json.loads(raw).get("url", "")
+        except Exception:
+            url = raw
+        if url:
+            r.rpush(URLS_DB_QUEUE, json.dumps({"url": url}))
+            pushed += 1
+
+    for url in r.smembers(SCRAPED_URLS_KEY):
+        r.rpush(URLS_DB_QUEUE, json.dumps({"url": url}))
+        pushed += 1
+
+    return {
+        "pushed":  pushed,
+        "pending": r.llen(PENDING_URLS_KEY),
+        "scraped": r.scard(SCRAPED_URLS_KEY),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Browser helpers
 # ---------------------------------------------------------------------------

@@ -36,12 +36,16 @@ WORKER_ID  = os.getenv("HOSTNAME", "worker")   # Docker hostname = container id
 _stats: dict = {"processed": 0, "failed": 0, "running": False}
 
 
+BROWSER_RESTART_EVERY = 30
+
+
 def _worker_loop():
     log.info(f"[{WORKER_ID}] Scraper worker başladı — kuyruk: {PENDING_URLS_KEY}")
     r = get_redis()
 
     with sync_playwright() as playwright:
         page = _launch_page(playwright)
+        restart_counter = 0
 
         while _stats["running"]:
             item = r.brpop(PENDING_URLS_KEY, timeout=5)
@@ -83,6 +87,13 @@ def _worker_loop():
 
                 r.sadd(SCRAPED_URLS_KEY, url)
                 _stats["processed"] += 1
+
+                restart_counter += 1
+                if restart_counter >= BROWSER_RESTART_EVERY:
+                    log.info(f"[{WORKER_ID}] Browser yeniden başlatılıyor (memory temizlendi)...")
+                    page.context.browser.close()
+                    page = _launch_page(playwright)
+                    restart_counter = 0
 
             except Exception as e:
                 log.warning(f"[{WORKER_ID}] Hata, tekrar kuyruğa alındı: {e}")
