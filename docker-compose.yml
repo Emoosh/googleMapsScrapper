@@ -79,6 +79,8 @@ services:
       - HEADLESS=true
       - REDIS_URL=redis://redis:6379
       - PROXY_URL=socks5://tor:9050
+      - TOR_HOST=tor
+      - TOR_PASSWORD=torpass
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 15s
@@ -111,6 +113,8 @@ services:
       - REDIS_URL=redis://redis:6379
       - PROXY_URL=socks5://tor:9050
       - SCRAPER_OUTPUT=/data/scraped_data.json
+      - TOR_HOST=tor
+      - TOR_PASSWORD=torpass
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8085/health"]
       interval: 15s

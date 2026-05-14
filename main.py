@@ -207,6 +207,7 @@ def _accept_consent(page: Page):
 
 def _renew_tor_circuit():
     tor_host = os.getenv("TOR_HOST", "localhost")
+    tor_password = os.getenv("TOR_PASSWORD", "")
     try:
         with urllib.request.urlopen(f"http://{tor_host}:8118", timeout=3):
             pass
@@ -215,7 +216,8 @@ def _renew_tor_circuit():
     try:
         import socket
         s = socket.create_connection((tor_host, 9051), timeout=5)
-        s.sendall(b"AUTHENTICATE\r\nSIGNAL NEWNYM\r\n")
+        auth_cmd = f'AUTHENTICATE "{tor_password}"\r\nSIGNAL NEWNYM\r\n'.encode()
+        s.sendall(auth_cmd)
         s.close()
         log.info("[tor] Yeni devre istendi.")
         time.sleep(5)
@@ -234,6 +236,7 @@ def _goto(page: Page, url: str, retries: int = 3):
         _accept_consent(page)
         return
     log.error(f"[captcha] {retries} denemede de bot sayfası aşılamadı: {url}")
+    raise RuntimeError(f"captcha aşılamadı: {url}")
 
 
 # ---------------------------------------------------------------------------
